@@ -1,0 +1,338 @@
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from scipy.optimize import differential_evolution, dual_annealing
+from sklearn.metrics import mean_squared_error, mean_absolute_error
+import warnings
+from datetime import datetime, timedelta
+import matplotlib.dates as mdates
+
+warnings.filterwarnings('ignore')
+
+# 读取数据
+data_table4 = [
+    20.1177894911454, 21.646335496605, 31.0158945303481, 40.5070068491122, 41.4588739698033,
+    40.3803232399953, 45.0279857509364, 23.5750521536399, 27.6600546834744, 28.5191082815942,
+    22.8609046534204, 54.4147422540849, 56.3573355859436, 54.6330051897827, 59.2022437511104,
+    55.9850907090177, 37.2740902610102, 43.2758842015125, 44.3376586364764, 46.9259394111432,
+    74.7459255932527, 69.1356934285935, 74.9930344469502, 75.0219459820604, 72.3298812388622,
+    52.8119210446267, 53.9450597449993, 52.3878161562733, 55.7438231214205, 81.1194935024925,
+    86.6483687041569, 81.2546627710194, 83.2153838796871, 81.3693711250492, 53.7770542498868,
+    59.5876626266183, 58.5586289838065, 54.5367958404869, 80.8017763907069, 71.8755686440233,
+    73.5099548772512, 68.9524676567441, 67.924134305192, 44.8615992090965, 36.494980836435,
+    35.4181151663058, 31.5646896056872, 71.6705040808901, 68.6749186468646, 65.5374934558589,
+    58.2082006159886, 60.4376214148294, 17.2407840317907, 12.300893881557, 10.951981452467,
+    12.9869124158571, 36.8779516681287, 31.1230858133291, 32.2821420078382, 28.5904955159291
+]
+y_observed = np.array(data_table4)
+t = np.arange(0, 60) 
+
+# 定义模型函数
+def main_road_prediction(params, t0):
+    """计算主路4的预测流量"""
+    t1, t2, t3, t4, a1, a2, b0, C, d1, g = params
+    
+    # 支路1函数 
+    def f1(t_val):
+        if t_val < t1:
+            return 0.0
+        elif t1 <= t_val < t2:
+            return a1 * (t_val - t1)
+        elif t2 <= t_val < t3:
+            return a1 * (t2 - t1)  
+        elif t3 <= t_val < t4:
+            return max(0, a1 * (t2 - t1) * (1 - (t_val - t3) / (t4 - t3)))
+        else:
+            return 0.0
+    
+    # 支路2函数
+    def f2(t_val):
+        if t_val < 0: 
+            return max(0, b0 + (C - b0) / 17 * (-1))
+        elif t_val <= 17:
+            return b0 + (C - b0) / 17 * t_val
+        elif t_val < 35:
+            return C
+        else:
+            return C + d1 * (t_val - 35)
+    
+    # 支路3
+    def f3(t_val):
+        residue = (t_val - t0) % 9
+        if residue < 0:
+            residue += 9
+        return g if residue <= 4 else 0.0
+    
+    # 计算主路的预测值（考虑延迟）
+    y_pred = []
+    for t_i in t:
+        val = f1(t_i - 1) + f2(t_i - 1) + f3(t_i)
+        y_pred.append(val)
+    
+    return np.array(y_pred)
+
+# 定义MSE
+def objective(params, t0, y_true):
+    y_pred = main_road_prediction(params, t0)
+    return mean_squared_error(y_true, y_pred)
+
+# 定义参数边界
+bounds = [
+    (0, 20),    # t1
+    (20, 40),   # t2
+    (40, 48),   # t3
+    (48, 59),   # t4
+    (0, 5),     # a1
+    (0, 3),     # a2 
+    (0, 20),    # b0
+    (20, 50),   # C
+    (-2, 0),    # d1
+    (0, 50)     # g
+]
+
+# 优化过程（GA-SA）
+best_mse = float('inf')
+best_params = None
+best_t0 = None
+
+# 遍历可能的绿灯起始时间t0 
+for t0_candidate in range(0, 9):
+    # 遗传算法
+    result_de = differential_evolution(
+        lambda params: objective(params, t0_candidate, y_observed),
+        bounds,
+        strategy='best1bin',
+        maxiter=100,
+        popsize=15,
+        tol=0.01,
+        mutation=(0.5, 1),
+        recombination=0.7,
+        seed=42
+    )
+    
+    # 模拟退火
+    result_sa = dual_annealing(
+        lambda params: objective(params, t0_candidate, y_observed),
+        bounds,
+        x0=result_de.x,
+        maxiter=200,
+        initial_temp=5230,
+        restart_temp_ratio=2e-5,
+        seed=42
+    )
+    
+    # 记录最佳结果
+    if result_sa.fun < best_mse:
+        best_mse = result_sa.fun
+        best_params = result_sa.x
+        best_t0 = t0_candidate
+
+print(f"最佳t0: {best_t0}")
+print(f"最佳参数: {best_params}")
+print(f"最小MSE: {best_mse}")
+
+# 提取最优参数
+t1, t2, t3, t4, a1, a2, b0, C, d1, g = best_params
+t0 = best_t0
+
+# 定义最终函数 
+def f1(t_val):
+    if t_val < t1:
+        return 0.0
+    elif t1 <= t_val < t2:
+        return a1 * (t_val - t1)
+    elif t2 <= t_val < t3:
+        return a1 * (t2 - t1)  
+    elif t3 <= t_val < t4:
+        return max(0, a1 * (t2 - t1) * (1 - (t_val - t3) / (t4 - t3)))
+    else:
+        return 0.0
+
+def f2(t_val):
+    if t_val < 0:
+        return max(0, b0 + (C - b0)/17 * (-1))
+    elif t_val <= 17:
+        return b0 + (C - b0)/17 * t_val
+    elif t_val < 35:
+        return C
+    else:
+        return C + d1 * (t_val - 35)
+
+def f3(t_val):
+    residue = (t_val - t0) % 9
+    if residue < 0:
+        residue += 9
+    return g if residue <= 4 else 0.0
+
+# 计算预测值和误差
+y_pred = main_road_prediction(best_params, best_t0)
+rmse = np.sqrt(mean_squared_error(y_observed, y_pred))
+mae = mean_absolute_error(y_observed, y_pred)
+
+# 计算MAPE
+def safe_mape(y_true, y_pred):
+    mask = y_true != 0
+    return np.mean(np.abs((y_true[mask] - y_pred[mask]) / y_true[mask])) * 100
+
+mape = safe_mape(y_observed, y_pred)
+
+# 计算PSI (Population Stability Index)
+def calculate_psi(expected, actual, bins=10):
+    min_val = min(min(expected), min(actual))
+    max_val = max(max(expected), max(actual))
+    breaks = np.linspace(min_val, max_val, bins+1)
+    
+    expected_perc = np.histogram(expected, breaks, density=True)[0]
+    actual_perc = np.histogram(actual, breaks, density=True)[0]
+    
+    expected_perc = np.clip(expected_perc, 1e-5, 1)
+    actual_perc = np.clip(actual_perc, 1e-5, 1)
+    
+    return np.sum((actual_perc - expected_perc) * np.log(actual_perc / expected_perc))
+
+psi = calculate_psi(y_observed, y_pred)
+
+# 计算SSS (Structural Similarity Score)
+def calculate_sss(observed, predicted):
+    mu_obs = np.mean(observed)
+    mu_pred = np.mean(predicted)
+    covar = np.cov(observed, predicted)[0, 1]
+    var_obs = np.var(observed)
+    var_pred = np.var(predicted)
+    
+    c1 = (0.01 * np.max(observed)) ** 2
+    c2 = (0.03 * np.max(observed)) ** 2
+    
+    ssim = ((2 * mu_obs * mu_pred + c1) * (2 * covar + c2)) / \
+           ((mu_obs ** 2 + mu_pred ** 2 + c1) * (var_obs + var_pred + c2))
+    return ssim
+
+sss = calculate_sss(y_observed, y_pred)
+
+# 输出误差指标
+print(f"RMSE: {rmse:.4f}")
+print(f"MAE: {mae:.4f}")
+print(f"MAPE: {mape:.2f}%")
+print(f"PSI: {psi:.4f}")
+print(f"SSS: {sss:.4f}")
+ 
+# 计算特定时刻的流量
+def calculate_flows(t_val):
+    flow1 = f1(t_val)
+    flow2 = f2(t_val)
+    flow3 = f3(t_val)
+    return flow1, flow2, flow3
+
+# 7:30 (t=15
+flow1_730, flow2_730, flow3_730 = calculate_flows(15)
+# 8:30 (t=45
+flow1_830, flow2_830, flow3_830 = calculate_flows(45)
+
+print("\n7:30 时刻车流量:")
+print(f"支路1: {flow1_730:.2f}, 支路2: {flow2_730:.2f}, 支路3: {flow3_730:.2f}")
+print("8:30 时刻车流量:")
+print(f"支路1: {flow1_830:.2f}, 支路2: {flow2_830:.2f}, 支路3: {flow3_830:.2f}")
+
+# 时间转换函数
+def t_to_time(t_val):
+    base_time = datetime(2023, 1, 1, 7, 0)  # t=0 对应 7:00
+    delta_minutes = 2 * int(t_val)
+    delta = timedelta(minutes=delta_minutes)
+    return base_time + delta
+
+t_full = np.arange(-1, 60) 
+
+# 计算各支路流量
+f1_vals = [f1(t_i) for t_i in t_full]
+f2_vals = [f2(t_i) for t_i in t_full]
+f3_vals = [f3(t_i) for t_i in t_full]
+
+# 转换为实际时间
+times = [t_to_time(t) for t in t_full]
+
+# 创建子图
+plt.figure(figsize=(15, 12))
+
+# 支路1
+plt.subplot(3, 1, 1)
+plt.plot(times, f1_vals, 'b-', linewidth=2, label='Branch 1')
+plt.xlabel('Time (minutes since 7:00 to 8:58)', fontsize=16)
+plt.ylabel('Trafflic Flow', fontsize=16)
+plt.gca().xaxis.set_major_formatter(mdates.DateFormatter('%H:%M'))
+plt.grid(True, linestyle='--', alpha=0.7)
+plt.legend()
+
+# 支路2
+plt.subplot(3, 1, 2)
+plt.plot(times, f2_vals, 'g-', linewidth=2, label='Branch 2')
+plt.xlabel('Time (minutes since 7:00 to 8:58)', fontsize=16)
+plt.ylabel('Trafflic Flow', fontsize=16)
+plt.gca().xaxis.set_major_formatter(mdates.DateFormatter('%H:%M'))
+plt.grid(True, linestyle='--', alpha=0.7)
+plt.legend()
+
+# 支路3
+plt.subplot(3, 1, 3)
+plt.step(times, f3_vals, 'r-', where='post', linewidth=2, label='Branch 3')
+plt.xlabel('Time (minutes since 7:00 to 8:58)', fontsize=16)
+plt.ylabel('Trafflic Flow', fontsize=16)
+plt.gca().xaxis.set_major_formatter(mdates.DateFormatter('%H:%M'))
+plt.grid(True, linestyle='--', alpha=0.7)
+plt.yticks([0, g], ['0', f'{g:.1f}'])
+plt.legend()
+
+plt.tight_layout()
+plt.savefig('branch_road_flows.png', dpi=300)
+plt.show()
+
+# 主路流量预测与对比
+t_times = [t_to_time(t_i) for t_i in t]
+
+plt.figure(figsize=(12, 8))
+plt.plot(t_times, y_observed, 'bo-', label='Observed Flow', alpha=0.7, markersize=4)
+plt.plot(t_times, y_pred, 'r--', label='Predicted Flow', linewidth=2)
+plt.title('Main Road 4 Traffic Flow: Observed vs Predicted', fontsize=14)
+plt.xlabel('Time', fontsize=12)
+plt.ylabel('Flow (pcu)', fontsize=12)
+plt.gca().xaxis.set_major_formatter(mdates.DateFormatter('%H:%M'))
+plt.legend()
+plt.grid(True, linestyle='--', alpha=0.7)
+plt.savefig('main_road_comparison.png', dpi=300)
+plt.show()
+
+# 模型对比（时间延迟处理）
+y_pred_no_delay = [f1(t_i) + f2(t_i) + f3(t_i) for t_i in t]
+rmse_delay = np.sqrt(mean_squared_error(y_observed, y_pred))
+rmse_no_delay = np.sqrt(mean_squared_error(y_observed, y_pred_no_delay))
+
+plt.figure(figsize=(10, 6))
+models = ['With Delay', 'Without Delay']
+rmse_values = [rmse_delay, rmse_no_delay]
+plt.bar(models, rmse_values, color=['blue', 'orange'])
+plt.title('Model Comparison: Impact of Time Delay Handling', fontsize=14)
+plt.ylabel('RMSE', fontsize=12)
+plt.grid(True, axis='y', linestyle='--', alpha=0.7)
+plt.savefig('delay_comparison.png', dpi=300)
+plt.show()
+
+print("\n模型对比:")
+print(f"考虑延迟的RMSE: {rmse_delay:.4f}")
+print(f"不考虑延迟的RMSE: {rmse_no_delay:.4f}")
+
+# 输出函数表达式
+print("\n函数表达式:")
+print("支路1:")
+print(f"f1(t) = 0, t < {t1:.1f}")
+print(f"f1(t) = {a1:.2f}*(t - {t1:.1f}), {t1:.1f} ≤ t < {t2:.1f}")
+print(f"f1(t) = {a1*(t2-t1):.2f}, {t2:.1f} ≤ t < {t3:.1f}")
+print(f"f1(t) = {a1*(t2-t1):.2f} * (1 - (t - {t3:.1f}) / ({t4:.1f} - {t3:.1f})), {t3:.1f} ≤ t < {t4:.1f}")
+print(f"f1(t) = 0, t ≥ {t4:.1f}")
+
+print("\n支路2:")
+print(f"f2(t) = max(0, {b0:.2f} + ({C-b0:.2f}/17 * t), t ≤ 17")
+print(f"f2(t) = {C:.2f}, 17 < t < 35")
+print(f"f2(t) = {C:.2f} + {d1:.2f}*(t - 35), t ≥ 35")
+
+print("\n支路3:")
+print(f"f3(t) = {g:.2f} when (t - {t0}) mod 9 ≤ 4")
+print(f"f3(t) = 0 otherwise")
