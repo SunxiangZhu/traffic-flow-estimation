@@ -1,0 +1,368 @@
+import numpy as np
+import pandas as pd
+from scipy.optimize import minimize
+import matplotlib.pyplot as plt
+from sklearn.decomposition import PCA
+from sklearn.metrics import mean_squared_error
+
+# 加载数据
+data_table4 = [
+    20.1177894911454, 21.646335496605, 31.0158945303481, 40.5070068491122, 41.4588739698033,
+    40.3803232399953, 45.0279857509364, 23.5750521536399, 27.6600546834744, 28.5191082815942,
+    22.8609046534204, 54.4147422540849, 56.3573355859436, 54.6330051897827, 59.2022437511104,
+    55.9850907090177, 37.2740902610102, 43.2758842015125, 44.3376586364764, 46.9259394111432,
+    74.7459255932527, 69.1356934285935, 74.9930344469502, 75.0219459820604, 72.3298812388622,
+    52.8119210446267, 53.9450597449993, 52.3878161562733, 55.7438231214205, 81.1194935024925,
+    86.6483687041569, 81.2546627710194, 83.2153838796871, 81.3693711250492, 53.7770542498868,
+    59.5876626266183, 58.5586289838065, 54.5367958404869, 80.8017763907069, 71.8755686440233,
+    73.5099548772512, 68.9524676567441, 67.924134305192, 44.8615992090965, 36.494980836435,
+    35.4181151663058, 31.5646896056872, 71.6705040808901, 68.6749186468646, 65.5374934558589,
+    58.2082006159886, 60.4376214148294, 17.2407840317907, 12.300893881557, 10.951981452467,
+    12.9869124158571, 36.8779516681287, 31.1230858133291, 32.2821420078382, 28.5904955159291
+]
+
+t = np.arange(0, 60)  
+y_observed = np.array(data_table4)  
+
+# 鲁棒PCA去噪
+def robust_pca_denoise(data, n_components=1):
+    pca = PCA(n_components=n_components)
+    denoised = pca.inverse_transform(pca.fit_transform(data.reshape(-1, 1)))
+    return denoised.flatten()
+
+# 应用鲁棒PCA去噪
+denoised_observed = robust_pca_denoise(y_observed)
+
+# 支路1的车流量模型
+def f1(t, params):
+    a, b, c, d, k1, k2 = params
+    if t < a:
+        return 0
+    elif a <= t < b:
+        return k1 * (t - a)
+    elif b <= t < c:
+        return k1 * (b - a)
+    elif c <= t < d:
+        return k1 * (b - a) - k2 * (t - c)
+    else:
+        return 0
+
+# 支路2的车流量模型
+def f2(t, params):
+    p1, q1, r, p2 = params
+    if t < 0:  
+        return q1  
+    elif t < 17:  
+        return p1 * t + q1
+    elif 17 <= t < 35:  
+        return r
+    else: 
+        return r + p2 * (t - 35)
+
+# 支路3的车流量模型
+def f3(t, light_cycles):
+    for cycle in light_cycles:
+        start, end, model_type, params = cycle
+        if start <= t < end:
+            if model_type == 'constant':
+                return params[0]
+            elif model_type == 'linear':
+                slope, intercept = params
+                return slope * (t - start) + intercept
+    return 0  
+
+# 计算总车流量 - 考虑时间延迟
+def total_flow(t, f1_params, f2_params, light_cycles, delay=1):
+   
+    t1 = t - delay
+    
+    flow1 = f1(t1, f1_params) if t1 >= -1 else 0  # 支持t=-1
+    flow2 = f2(t1, f2_params) if t1 >= -1 else 0  # 支持t=-1
+    flow3 = f3(t, light_cycles)
+    
+    return flow1 + flow2 + flow3
+
+# 计算总车流量 - 不考虑时间延迟
+def total_flow_no_delay(t, f1_params, f2_params, light_cycles):
+
+    flow1 = f1(t, f1_params) if t >= 0 else 0
+    flow2 = f2(t, f2_params) if t >= 0 else 0
+    flow3 = f3(t, light_cycles)
+    
+    return flow1 + flow2 + flow3
+
+# 残差函数
+def residuals(params, t, observed, f1_params, f2_params, light_cycles):
+    model_flow = np.array([total_flow(i, f1_params, f2_params, light_cycles) for i in t])
+    return np.sum((observed - model_flow) ** 2)
+
+# 计算MAPE
+def safe_mape(y_true, y_pred):
+    mask = y_true != 0
+    if np.sum(mask) == 0:
+        return np.nan
+    return np.mean(np.abs((y_true[mask] - y_pred[mask]) / y_true[mask])) * 100
+
+# 计算PSI（Population Stability Index）
+def calculate_psi(expected, actual, bins=10):
+    min_val = min(min(expected), min(actual))
+    max_val = max(max(expected), max(actual))
+    breaks = np.linspace(min_val, max_val, bins+1)
+    
+    expected_perc = np.histogram(expected, breaks, density=True)[0]
+    actual_perc = np.histogram(actual, breaks, density=True)[0]
+
+    expected_perc = np.clip(expected_perc, 1e-5, 1)
+    actual_perc = np.clip(actual_perc, 1e-5, 1)
+    
+    # 计算PSI
+    psi = np.sum((actual_perc - expected_perc) * np.log(actual_perc / expected_perc))
+    return psi
+
+# 计算SSS（Structural Similarity Score）
+def calculate_sss(observed, predicted):
+    mu_obs = np.mean(observed)
+    mu_pred = np.mean(predicted)
+    covar = np.cov(observed, predicted)[0, 1]
+    var_obs = np.var(observed)
+    var_pred = np.var(predicted)
+    
+    # 稳定性常数
+    c1 = (0.01 * np.max(observed)) ** 2
+    c2 = (0.03 * np.max(observed)) ** 2
+    
+    # 计算SSS
+    sss = ((2 * mu_obs * mu_pred + c1) * (2 * covar + c2)) / \
+           ((mu_obs ** 2 + mu_pred ** 2 + c1) * (var_obs + var_pred + c2))
+    return sss
+
+# EM算法优化
+def em_algorithm(observed, t, light_cycle_length=9, green_duration=5, red_duration=4):
+    # 初始化参数 
+    f1_params = [5, 20, 40, 50, 0.85, 0.64]  # a, b, c, d, k1, k2
+    f2_params = [0.52, 20.12, 18.64, -0.42]  # p1, q1, r, p2 修正：q1=20.12
+    
+    # 确定信号灯周期
+    best_error = float('inf')
+    best_light_cycles = None
+    
+    # 尝试不同的绿灯起始时间
+    for start_time in range(0, 9):  
+        light_cycles = []
+        current_time = start_time
+        while current_time < 60:
+            # 绿灯时段
+            green_start = current_time
+            green_end = min(current_time + green_duration, 60)
+            light_cycles.append((green_start, green_end, 'constant', [5.0]))
+            
+            # 红灯时段
+            current_time += light_cycle_length
+    
+        # 计算误差
+        error = residuals(f1_params + f2_params, t, observed, f1_params, f2_params, light_cycles)
+        if error < best_error:
+            best_error = error
+            best_light_cycles = light_cycles
+    
+    light_cycles = best_light_cycles
+    
+    # 优化参数
+    def objective(params):
+        f1_p = params[:6]
+        f2_p = params[6:10]
+        return residuals(params, t, observed, f1_p, f2_p, light_cycles)
+    
+    initial_params = f1_params + f2_params
+    bounds = [
+        (0, 10), (15, 25), (35, 45), (45, 55), (0.5, 1.5), (0.3, 0.8),
+        (0.3, 0.7), (18, 22), (15, 20), (-0.5, -0.3)  
+    ]
+    
+    result = minimize(objective, initial_params, bounds=bounds, method='L-BFGS-B')
+    optimized_params = result.x
+    
+    # 分离参数
+    f1_params_opt = optimized_params[:6]
+    f2_params_opt = optimized_params[6:10]
+    
+    # 优化支路3模型
+    optimized_light_cycles = []
+    for cycle in light_cycles:
+        start, end, _, _ = cycle
+        indices = np.where((t >= start) & (t < end))[0]
+        if len(indices) == 0:
+            continue
+        
+        # 提取残差
+        res = observed[indices] - np.array([
+            f1(t_val - 1, f1_params_opt) + f2(t_val - 1, f2_params_opt) 
+            for t_val in t[indices]
+        ])
+        
+        # 尝试常数模型
+        constant_val = np.mean(res)
+        error_constant = np.sum((res - constant_val) ** 2)
+        
+        # 尝试线性模型
+        A = np.vstack([t[indices] - start, np.ones(len(indices))]).T
+        linear_params, _, _, _ = np.linalg.lstsq(A, res, rcond=None)
+        error_linear = np.sum((res - A.dot(linear_params)) ** 2)
+        
+        # 选择更好的模型
+        if error_constant < error_linear:
+            optimized_light_cycles.append((start, end, 'constant', [constant_val]))
+        else:
+            optimized_light_cycles.append((start, end, 'linear', linear_params))
+    
+    return f1_params_opt, f2_params_opt, optimized_light_cycles
+
+# 主函数
+def main():
+    # 使用去噪后的数据
+    observed = denoised_observed
+    
+    # 使用EM算法优化参数
+    f1_params, f2_params, light_cycles = em_algorithm(observed, t)
+    
+    # 计算拟合结果（考虑延迟）
+    model_flow = np.array([total_flow(i, f1_params, f2_params, light_cycles) for i in t])
+    
+    # 计算不考虑延迟的预测结果
+    model_flow_no_delay = np.array([total_flow_no_delay(i, f1_params, f2_params, light_cycles) for i in t])
+    
+    # 输出结果
+    print("="*50)
+    print("表4.1 支路车流量函数表达式")
+    print("="*50)
+    print("支路1:")
+    print(f"f1(t) = 0 (t < {f1_params[0]:.1f})")
+    print(f"f1(t) = {f1_params[4]:.2f}*(t-{f1_params[0]:.1f}) ({f1_params[0]:.1f} ≤ t < {f1_params[1]:.1f})")
+    print(f"f1(t) = {f1_params[4]*(f1_params[1]-f1_params[0]):.2f} ({f1_params[1]:.1f} ≤ t < {f1_params[2]:.1f})")
+    print(f"f1(t) = {f1_params[4]*(f1_params[1]-f1_params[0]):.2f} - {f1_params[5]:.2f}*(t-{f1_params[2]:.1f}) ({f1_params[2]:.1f} ≤ t < {f1_params[3]:.1f})")
+    print(f"f1(t) = 0 (t ≥ {f1_params[3]:.1f})")
+    
+    print("\n支路2:")
+    print(f"f2(t) = {f2_params[1]:.2f} (t < 0)") 
+    print(f"f2(t) = {f2_params[0]:.2f}*t + {f2_params[1]:.2f} (0 ≤ t < 17)")
+    print(f"f2(t) = {f2_params[2]:.2f} (17 ≤ t < 35)")
+    print(f"f2(t) = {f2_params[2]:.2f} + {f2_params[3]:.2f}*(t-35) (t ≥ 35)")
+    
+    print("\n支路3:")
+    for start, end, model_type, params in light_cycles:
+        if model_type == 'constant':
+            print(f"f3(t) = {params[0]:.2f} ({start} ≤ t < {end})")
+        elif model_type == 'linear':
+            print(f"f3(t) = {params[0]:.2f}*(t-{start}) + {params[1]:.2f} ({start} ≤ t < {end})")
+    
+    # 计算7:30和8:30的车流量
+    t_730 = 15  # 7:30对应t=15
+    t_830 = 45  # 8:30对应t=45
+    
+    flow1_730 = f1(t_730, f1_params)
+    flow2_730 = f2(t_730, f2_params)
+    flow3_730 = f3(t_730, light_cycles)
+    
+    flow1_830 = f1(t_830, f1_params)
+    flow2_830 = f2(t_830, f2_params)
+    flow3_830 = f3(t_830, light_cycles)
+    
+    print("\n" + "="*50)
+    print("表4.2 支路车流量数值")
+    print("="*50)
+    print(f"时刻\t\t支路1\t\t支路2\t\t支路3")
+    print(f"7:30\t\t{flow1_730:.2f}\t\t{flow2_730:.2f}\t\t{flow3_730:.2f}")
+    print(f"8:30\t\t{flow1_830:.2f}\t\t{flow2_830:.2f}\t\t{flow3_830:.2f}")
+    
+    # 特别输出t=0时刻各支路流量
+    print("\n" + "="*50)
+    print("t=0时刻(7:00)各支路流量分解")
+    print("="*50)
+    print(f"支路1(t=-1): {f1(-1, f1_params):.2f}")
+    print(f"支路2(t=-1): {f2(-1, f2_params):.2f}")
+    print(f"支路3(t=0): {f3(0, light_cycles):.2f}")
+    print(f"总流量: {f1(-1, f1_params)+f2(-1, f2_params)+f3(0, light_cycles):.2f}")
+    print(f"观测值: {y_observed[0]:.2f}")
+    
+    # 误差分析
+    rmse = np.sqrt(mean_squared_error(observed, model_flow))
+    mae = np.mean(np.abs(observed - model_flow))
+    mape = safe_mape(observed, model_flow)
+    psi = calculate_psi(observed, model_flow)
+    sss = calculate_sss(observed, model_flow)
+    
+
+    # 模型对比：考虑时间延迟 vs 不考虑时间延迟
+    # 计算不考虑延迟的模型性能
+    rmse_no_delay = np.sqrt(mean_squared_error(observed, model_flow_no_delay))
+    
+    print("\n" + "="*50)
+    print("模型对比：时间延迟处理的影响")
+    print("="*50)
+    print(f"考虑延迟的RMSE: {rmse:.4f}")
+    print(f"不考虑延迟的RMSE: {rmse_no_delay:.4f}")
+    print(f"性能提升: {((rmse_no_delay - rmse)/rmse_no_delay)*100:.2f}%")
+
+    # 可视化结果
+    
+    plt.figure(figsize=(14, 8))
+    
+    # 原始观测数据与模型拟合数据
+    plt.subplot(2, 1, 1)
+    plt.plot(t, y_observed, 'b-', label='原始观测流量')
+    plt.plot(t, denoised_observed, 'g-', label='去噪后流量')
+    plt.plot(t, model_flow, 'r--', label='模型预测流量')
+    plt.title('流量观测值与模型预测值对比')
+    plt.xlabel('时间 (t)')
+    plt.ylabel('车流量')
+    plt.legend()
+    plt.grid(True)
+    
+
+    plt.tight_layout()
+    plt.savefig('flow_comparison.png')
+    plt.show()
+    
+    # 输出各支路流量分解
+    plt.figure(figsize=(14, 10))
+    
+    # 计算各支路在不同时刻的流量
+    f1_flow = [f1(i-1, f1_params) if i-1 >= -1 else 0 for i in t]
+    f2_flow = [f2(i-1, f2_params) if i-1 >= -1 else 0 for i in t]
+    f3_flow = [f3(i, light_cycles) for i in t]
+    
+    plt.plot(t, f1_flow, 'b-', label='支路1流量')
+    plt.plot(t, f2_flow, 'g-', label='支路2流量')
+    plt.plot(t, f3_flow, 'r-', label='支路3流量')
+    plt.plot(t, model_flow, 'k--', label='模型总流量')
+    
+    # 标记t=0时刻
+    plt.axvline(x=0, color='m', linestyle='--', alpha=0.5)
+    plt.text(0, max(model_flow)*0.9, 't=0 (7:00)', rotation=90, verticalalignment='top')
+    
+    plt.title('支路车流量分解')
+    plt.xlabel('时间 (t)')
+    plt.ylabel('车流量')
+    plt.legend()
+    plt.grid(True)
+    plt.savefig('flow_decomposition.png')
+    plt.show()
+    
+    # 绘制观测值与预测值散点图
+    plt.figure(figsize=(10, 8))
+    plt.scatter(observed, model_flow, alpha=0.6)
+    
+    # 添加理想线
+    max_val = max(np.max(observed), np.max(model_flow))
+    plt.plot([0, max_val], [0, max_val], 'r--', label='理想拟合线')
+    
+    plt.title('观测值 vs 预测值')
+    plt.xlabel('观测流量')
+    plt.ylabel('预测流量')
+    plt.grid(True)
+    plt.legend()
+    plt.savefig('scatter_plot.png')
+    plt.show()
+
+if __name__ == "__main__":
+    main()
